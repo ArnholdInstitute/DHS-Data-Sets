@@ -16,7 +16,8 @@ import shutil
 import tempfile
 import zipfile
 
-from sqlalchemy import create_engine
+from odo import drop, odo
+#from sqlalchemy import create_engine
 
 # India has data broken down at the province / district level, with a two-
 # letter code for each region.  This causes a problem when we hit Kerala,
@@ -108,6 +109,11 @@ class DataDictionary:
         null_value = int(null_value)
       elif self.variable_type[vbl_label] == "float":
         null_value = float(null_value)
+      else:
+        if not vbl_label in self.null_encoding:
+          self.null_encoding[vbl_label] = dict()
+        self.null_encoding[vbl_label][null_value] = ""
+        return
     if not vbl_label in self.null_encoding:
       self.null_encoding[vbl_label] = dict()
     self.null_encoding[vbl_label][null_value] = None
@@ -140,7 +146,10 @@ class DataDictionary:
             "No calendar", "Flagged cases" , "No births"]:
           if not vbl_label in self.null_encoding:
             self.null_encoding[vbl_label] = dict()
-          self.null_encoding[vbl_label][value] = None
+          if self.variable_type[vbl_label] == "string":
+            self.null_encoding[vbl_label][value] = ""
+          else:
+            self.null_encoding[vbl_label][value] = None
           if self.value_dict[vbl_format][value] == "Flagged cases":
             self.null_encoding[vbl_label][value] = FLAGGED_CASES
           if self.value_dict[vbl_format][value] == "No births":
@@ -173,6 +182,8 @@ class DataDictionary:
       vbl_name = self.variable_dict[vbl_label]
       if value == ' ' * len(value) or value == '*' * len(value):
         record_dict[vbl_name] = None
+        if self.variable_type[vbl_label] == "string":
+          record_dict[vbl_name] = ""
         continue
       # The data dictionary for first time of breastfeeding is special and
       # requires separate interpretation.
@@ -278,9 +289,8 @@ def main():
   pg_password = input("Password:")
     
   pg_login = pg_username + ":" + pg_password
-  engine = create_engine(
-      'postgresql://' + pg_login + '@' + aws_ip + ':5432/dhs_data',
-      echo=False, paramstyle='format')
+  pg_conn_str = 'postgresql://' + pg_login + '@' + aws_ip + ':5432/dhs_data'
+  #engine = create_engine(pg_conn_str, echo=False, paramstyle='format')
 
   vbl_nolabel_pattern = "attrib (\S+)\s*(length=\$?\d+)?;"
   vbl_label_pattern = "attrib (\S+)\s+(length=\$?\d+)?\s*label=\"(.*)\";"
@@ -395,6 +405,7 @@ def main():
           if vbl_match:
             vbl_label = vbl_match.group(1)
             vbl_name = vbl_label + ' ' + vbl_match.group(3)
+            vbl_name = re.sub('\(|\)', ' ', vbl_name)
             data_dict.vbls_seen.add(vbl_name)
             data_dict.variable_dict[vbl_label] = vbl_name
             for idx_col_pattern in INDEX_COLUMNS:
@@ -403,12 +414,14 @@ def main():
           elif vbl_nolabel_match:
             vbl_label = vbl_nolabel_match.group(1)
             vbl_name = vbl_label
+            vbl_name = re.sub('\(|\)', ' ', vbl_name)
             data_dict.vbls_seen.add(vbl_name)
             data_dict.variable_dict[vbl_label] = vbl_name
           elif vbl_format_match:
             vbl_label = vbl_format_match.group(1)
             vbl_format = vbl_format_match.group(3)
             vbl_name = vbl_label + ' ' + vbl_format_match.group(4)
+            vbl_name = re.sub('\(|\)', ' ', vbl_name)
             data_dict.variable_format_dict[vbl_label] = vbl_format
             data_dict.vbls_seen.add(vbl_name)
             data_dict.variable_dict[vbl_label] = vbl_name
@@ -470,6 +483,7 @@ def main():
       df = pandas.DataFrame(columns=data_dict.vbls_seen)
       record_cnt = 0
       with open(os.path.join(tmpdir, datafile), mode="r") as data:
+        data_records = []
         for record in data:
 #         record = record.decode('utf-8')
 #         print("Length of record = " + str(len(record)))
@@ -480,7 +494,8 @@ def main():
             print ("Read " + str(record_cnt) + " records.")
           record_dict = data_dict.parse(record)
 #         print("Record has " + str(len(record_dict)) + " entries.")
-          df = df.append(record_dict, ignore_index=True)
+          data_records.append(record_dict)
+        df = df.append(data_records, ignore_index=True)
       
       print("Data file read; " + str(record_cnt) + " records seen.")
     
@@ -493,14 +508,20 @@ def main():
         if (col_cnt % MAX_COL_CNT) == 0 or col_cnt == len(df.columns):
           table_name = base_table_name
           if table_cnt > 0:
-            table_name += " (" + str(table_cnt) + ")"
-          print("Writing " + table_name)
+            table_name += "-" + str(table_cnt)
+          print("Writing to " + table_name)
           export_df = df.loc[:, sorted(list(col_set))]
-          export_df.to_sql(name=table_name, con=engine, if_exists='replace')
+          #print(export_df.shape)
+          #export_df.to_sql(name=table_name, con=engine, if_exists='replace')
+          try:
+            drop(pg_conn_str + "::" + table_name)
+          except:
+            print(table_name + " does not exist.  Creating from scratch.")
+          odo(export_df, pg_conn_str + "::" + table_name)
           col_set.clear()
           col_set |= index_cols
           table_cnt += 1
-          print("Finished writing " + table_name)
+          print("Finished writing to " + table_name)
 
     shutil.rmtree(tmpdir)
 
