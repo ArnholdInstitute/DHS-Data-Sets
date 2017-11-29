@@ -16,7 +16,7 @@ Intended to be run on the PSQL machine.
 # the hash of the index column values. This way, when we want to join, we can
 # join on that one column alone and don't need the map.
 
-import re
+import getpass
 from sqlalchemy import create_engine
 
 # Index columns are identified by having one of these substrings.
@@ -35,7 +35,7 @@ def get_index_column_query(table_name):
 
 def main():
   pg_username = input("Please enter Postgres username:")
-  pg_password = input("Password:")
+  pg_password = getpass.getpass("Password:")
     
   pg_login = pg_username + ":" + pg_password
   pg_conn_str = 'postgresql://' + pg_login + '@localhost:5432/dhs_data'
