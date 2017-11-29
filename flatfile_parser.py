@@ -7,13 +7,15 @@
 # them is such that the standard pandas.read_stata and .read_sas do not work
 # well. (And the one workaround I've found online doesn't.)
 
+#import csv
 import glob
 import optparse
 import os
-import pandas
+#import pandas
 import re
 import shutil
 import tempfile
+import timeit
 import zipfile
 
 from odo import drop, odo
@@ -74,6 +76,8 @@ INDEX_COLUMNS = [ "Facility number", "Unit line number", "unit type",
 
 FLAGGED_CASES = 999999
 BF_IDENTIFIER = "When child put to breast"
+NULL_INT_VALUE = -999
+NULL_FLOAT_VALUE = -999.0
 
 RECORD_LIMIT = 0
 MAX_COL_CNT = 700    # psycopg2, and hence Postgres, have a hard cap of 1600.
@@ -86,7 +90,8 @@ class DataDictionary:
     self.variable_dict = dict()         # Maps the variable label to vbl name
     self.variable_format_dict = dict()  # Maps variable label to vbl format
     self.vbls_seen = set()              # Maintains a list of vbl names seen.
-    self.variable_type = dict()         # Maps variable label to "int"/"string"
+    self.key_type = dict()              # Maps vbl label to encoded field type
+    self.variable_type = dict()         # Maps vbl label to decoded field type
     self.bytewise_encoding = dict()     # Maps variable label to start+end pos.
     self.null_encoding = dict()    # Maps vbl label, null vals to display vals
     self.value_dict = dict()       # Maps vbl format, value, to display values
@@ -99,24 +104,32 @@ class DataDictionary:
         }
     decimal_pt = re.match("\d+\.(\d+)", num_len_string)
     if decimal_pt and int(decimal_pt.group(1)) > 0:
-      self.variable_type[vbl_label] = "float"
+      self.key_type[vbl_label] = "float32"
+    elif re.search("\$", num_len_string):
+      self.key_type[vbl_label] = "string"
     else:
-      self.variable_type[vbl_label] = "int"
+      self.key_type[vbl_label] = "int32"
+    if vbl_label in self.variable_format_dict:
+      self.variable_type[vbl_label] = "string"
+    else:
+      self.variable_type[vbl_label] = self.key_type[vbl_label]
             
   def add_null_rule(self, vbl_label, null_value):
+    if not vbl_label in self.null_encoding:
+      self.null_encoding[vbl_label] = dict()
+    self.null_encoding[vbl_label][null_value] = NULL_INT_VALUE
     if vbl_label in self.variable_type:
-      if self.variable_type[vbl_label] == "int":
+      if self.variable_type[vbl_label] == "int32":
         null_value = int(null_value)
-      elif self.variable_type[vbl_label] == "float":
+        self.null_encoding[vbl_label][null_value] = NULL_INT_VALUE
+        return
+      elif self.variable_type[vbl_label] == "float32":
         null_value = float(null_value)
+        self.null_encoding[vbl_label][null_value] = NULL_FLOAT_VALUE
       else:
         if not vbl_label in self.null_encoding:
           self.null_encoding[vbl_label] = dict()
         self.null_encoding[vbl_label][null_value] = ""
-        return
-    if not vbl_label in self.null_encoding:
-      self.null_encoding[vbl_label] = dict()
-    self.null_encoding[vbl_label][null_value] = None
         
   def clean_formats(self):
     erased_format_values = dict()
@@ -143,19 +156,19 @@ class DataDictionary:
               str(self.value_dict[vbl_format][value]) + "|")
         # Maybe do something else with flagged cases?
         if self.value_dict[vbl_format][value] in ["Don't know", "DK", "DK ",
-            "No calendar", "Flagged cases" , "No births"]:
+            "No calendar", "Flagged cases", "No births"]:
           if not vbl_label in self.null_encoding:
             self.null_encoding[vbl_label] = dict()
-          if self.variable_type[vbl_label] == "string":
-            self.null_encoding[vbl_label][value] = ""
-          else:
-            self.null_encoding[vbl_label][value] = None
+          self.add_null_rule(vbl_label, value)
+          self.variable_type[vbl_label] = self.key_type[vbl_label]
           if self.value_dict[vbl_format][value] == "Flagged cases":
             self.null_encoding[vbl_label][value] = FLAGGED_CASES
+            self.variable_type[vbl_label] = "int32"
           if self.value_dict[vbl_format][value] == "No births":
             self.null_encoding[vbl_label][value] = 0
+            self.variable_type[vbl_label] = "int32"
           erased_format_values[vbl_format] = { value :
-            self.null_encoding[vbl_label][value] }
+              self.null_encoding[vbl_label][value] }
           del self.value_dict[vbl_format]
       elif (len(self.value_dict[vbl_format]) == 2 and
             set(self.value_dict[vbl_format].values()) == set(["Yes", "No"])):
@@ -164,6 +177,9 @@ class DataDictionary:
             self.value_dict[vbl_format][key] = True
           else:
             self.value_dict[vbl_format][key] = False
+        self.variable_type[vbl_label] = "bool"
+        if vbl_label in self.null_encoding:
+          del self.null_encoding[vbl_label]
             
       formats_seen.add(vbl_format)
       if vbl_format not in self.value_dict:            
@@ -184,14 +200,22 @@ class DataDictionary:
         record_dict[vbl_name] = None
         if self.variable_type[vbl_label] == "string":
           record_dict[vbl_name] = ""
+          continue
+        elif self.variable_type[vbl_label] == "int32":
+          record_dict[vbl_name] = NULL_INT_VALUE
+        elif self.variable_type[vbl_label] == "float32":
+          record_dict[vbl_name] = NULL_FLOAT_VALUE
+        elif self.variable_type[vbl_label] == "bool":
+          record_dict[vbl_name] = False
         continue
       # The data dictionary for first time of breastfeeding is special and
       # requires separate interpretation.
       if re.search(BF_IDENTIFIER, vbl_name):
+        self.variable_type[vbl_label] = "string"
         value = int(value)
         if value == 0:
           record_dict[vbl_name] = "Immediately"
-        elif value > 100 and value < 200:
+        elif value >= 100 and value < 200:
           record_dict[vbl_name] = str(value - 100) + " hours"
         elif value > 200 and value < 300:
           record_dict[vbl_name] = str(value - 200) + " days"
@@ -199,14 +223,14 @@ class DataDictionary:
           # Throw an error.
           print(str(value) + " is not a valid value for " + vbl_name)
         continue
-      if self.variable_type[vbl_label] == "int":
+      if self.key_type[vbl_label] == "int32":
         try:
           value = int(value)
         except ValueError:
           print("Cannot parse |" + value + "| as int for field |" + vbl_label +
                 "| in schema " + self.name)
           continue
-      elif self.variable_type[vbl_label] == "float":
+      elif self.key_type[vbl_label] == "float32":
         try:
           value = float(value)
         except:
@@ -223,27 +247,29 @@ class DataDictionary:
               value_found = True
               break
           if value_found: continue
-        if vbl_label in self.variable_format_dict:
-          vbl_format = self.variable_format_dict[vbl_label]
-          if vbl_format in self.value_dict:
-            for mapped_value in self.value_dict[vbl_format]:
-              if abs(value - mapped_value) <= FLOAT_ERROR:
-                record_dict[vbl_name] = str(
-                    self.value_dict[vbl_format][mapped_value])
-                value_found = True
-                break
-            if value_found:
-              continue
-            else:
-              record_dict[vbl_name] = value
-              continue
-          else:
-            # Throw an exception
-            print(vbl_format + ' value dictionary not found.')
-            continue
-        else:
-          record_dict[vbl_name] = value
-          continue
+        # Hard override: ignore all variable format dicts for floats.
+        # Just use the encoded value.
+        record_dict[vbl_name] = value
+        continue
+#        if vbl_label in self.variable_format_dict:
+#          vbl_format = self.variable_format_dict[vbl_label]
+#          if vbl_format in self.value_dict:
+#            for mapped_value in self.value_dict[vbl_format]:
+#              if abs(value - mapped_value) <= FLOAT_ERROR:
+#                record_dict[vbl_name] = str(
+#                    self.value_dict[vbl_format][mapped_value])
+#                value_found = True
+#                break
+#            if value_found:
+#              continue
+#            else:
+#              record_dict[vbl_name] = value
+#              continue
+#          else:
+#            # Throw an exception
+#            print(vbl_format + ' value dictionary not found.')
+#            continue
+#        else:
           
       if (vbl_label in self.null_encoding and 
           value in self.null_encoding[vbl_label]):
@@ -254,7 +280,7 @@ class DataDictionary:
           if value in self.value_dict[vbl_format]:
             record_dict[vbl_name] = self.value_dict[vbl_format][value]
           # We sometimes have multiple-choice answers, coded by characters.
-          elif self.variable_type[vbl_label] == "string":
+          elif self.key_type[vbl_label] == "string":
             display_vals = []
             #print("Vbl label = |" + vbl_label + "|")
             for encoded_val in self.value_dict[vbl_format]:
@@ -266,14 +292,33 @@ class DataDictionary:
           else:
             # Record the value anyway.
             record_dict[vbl_name] = str(value)
+            if (vbl_label in self.variable_type and
+                self.variable_type[vbl_label] == "bool"):
+              record_dict[vbl_name] = False
         else:
           # Throw an exception
           print(vbl_format + ' value dictionary not found.')
       else:
-        if self.variable_type[vbl_label] == "int": value = int(value)
         record_dict[vbl_name] = value
-        
+        if (vbl_label in self.variable_type and
+            self.variable_type[vbl_label] == "bool"):
+          record_dict[vbl_name] = False
+          
+      if not vbl_name in record_dict or record_dict[vbl_name] == "":
+        if self.variable_type[vbl_label] == "int32":
+          record_dict[vbl_name] = NULL_INT_VALUE
+        elif self.variable_type[vbl_label] == "float32":
+          record_dict[vbl_name] = NULL_FLOAT_VALUE
+          
     return record_dict
+
+
+# Intended for cleaning column names.
+def clean_name(vbl_name):
+  name = re.sub('\(|\)', ' ', vbl_name)
+  name = re.sub(':', '-', name)
+  name = re.sub('\'|\"', "", name)
+  return name
 
 
 def main():
@@ -292,22 +337,21 @@ def main():
   pg_conn_str = 'postgresql://' + pg_login + '@' + aws_ip + ':5432/dhs_data'
   #engine = create_engine(pg_conn_str, echo=False, paramstyle='format')
 
-  vbl_nolabel_pattern = "attrib (\S+)\s*(length=\$?\d+)?;"
-  vbl_label_pattern = "attrib (\S+)\s+(length=\$?\d+)?\s*label=\"(.*)\";"
-  vbl_format_label_pattern = "attrib (\S+)\s*(length=\$?\d+)?\s*"
-  vbl_format_label_pattern += " format=(\S*)\. label=\"(.*)\";"
-  bytewise_pattern = "@(\d+)\s*(\S+)\s*\$?(\d+\.?\d*)*"
+  vbl_pattern = "attrib (?P<label>\S+)\s+(?:length=(?P<length>\$?\d+))?"
+  vbl_pattern += "\s*(?:format=(?P<format>\S*)\.)?"
+  vbl_pattern += "\s*(?:label=\"(?P<desc>.*)\")?;"
+  bytewise_pattern = "@(\d+)\s*(\S+)\s*(\$?\d+\.?\d*)*"
   nullrule_pattern = "if (\S+)\s+=\s+(\S+) then \1 = (.*);"
   
   print("Path = " + args[0])
-  print(args[0] + '/*.ZIP')
+  print(args[0] + '/*.zip')
   print(glob.glob(args[0] + '/*'))
   
   index_cols = dict()
   
-  for zfile in glob.glob(args[0] + '/*.ZIP'):
+  for zfile in sorted(glob.glob(args[0] + '/*.zip')):
     print("Zipfile = " + zfile)
-    base_filename = re.search('/?(\w*)\.ZIP', zfile, re.IGNORECASE).group(1)
+    base_filename = re.search('/?(\w*)\.zip', zfile, re.IGNORECASE).group(1)
     tmpdir = tempfile.mkdtemp(prefix='dhs_zip-')
     with zipfile.ZipFile(zfile, mode="r") as zf_fh:
       schemafiles = set()
@@ -342,7 +386,8 @@ def main():
     else:
       base_table_name += "-" + survey_type + " Form"
     base_table_name += "-v" + survey_version
-    table_cnt = 0    
+    table_cnt = 0
+    writes_succeeded = True
     for schemafile in schemafiles:
       fname = schemafile.split('.')[-2]
       datafile = fname + ".DAT"
@@ -368,16 +413,13 @@ def main():
           # a string describing the meaning of the variable.  As the latter can
           # be duplicated (and since we do not want duplicate column names), we
           # append an incremented number to duplicate names.
+          # Additionally, the line may contain information on the length of
+          # the encoded field, or the format (data dictionary) we should use to
+          # interpret the values the field takes.
           # Example: "  attrib Q834Y_2  label="Year on guideline(2)";"
-          vbl_match = re.search(vbl_label_pattern, line)
-        
           # Example: "  attrib SDOMAIN  length=4;"
-          vbl_nolabel_match = re.search(vbl_nolabel_pattern, line)
-
-          # If that fails, it might be that we need to map the values the
-          # variable takes as well, in which case use the following.  Example:
-          # "  attrib UTYPE    format=F00001_. label="unit type";"
-          vbl_format_match = re.search(vbl_format_label_pattern, line)
+          # Example: "  attrib UTYPE    format=F00001_. label="unit type";"
+          vbl_match = re.search(vbl_pattern, line)
         
           # Next case is we are in the byte-wise definition of the flat file
           # records.  Example: "@164  Q831     1.0"
@@ -396,38 +438,25 @@ def main():
           value_start_match = re.search("value (\S+)\s*", line)
         
           # N.B. The ordering in the .SAS file is actually value-mapping 
-          # (value_start_match), followed by label-name matching (vbl_match and
-          # vbl_format_match interspersed), followed by the bytewise breakdown
-          # (bytewise match), followed by null rules (nullrule_match).  There
-          # are also a small number of lines that do not fit any of these
-          # patterns.
+          # (value_start_match), followed by label-name matching (vbl_match),
+          # followed by the bytewise breakdown (bytewise match), followed by
+          # null rules (nullrule_match).  There are also a small number of 
+          # lines that do not fit any of these patterns.
         
           if vbl_match:
-            vbl_label = vbl_match.group(1)
-            vbl_name = vbl_label + ' ' + vbl_match.group(3)
-            vbl_name = re.sub('\(|\)', ' ', vbl_name)
-            data_dict.vbls_seen.add(vbl_name)
-            data_dict.variable_dict[vbl_label] = vbl_name
-            for idx_col_pattern in INDEX_COLUMNS:
-              if re.search(idx_col_pattern, vbl_name, re.IGNORECASE):
-                index_cols.add(vbl_name)
-          elif vbl_nolabel_match:
-            vbl_label = vbl_nolabel_match.group(1)
+            vbl_label = vbl_match.group("label")
             vbl_name = vbl_label
-            vbl_name = re.sub('\(|\)', ' ', vbl_name)
-            data_dict.vbls_seen.add(vbl_name)
-            data_dict.variable_dict[vbl_label] = vbl_name
-          elif vbl_format_match:
-            vbl_label = vbl_format_match.group(1)
-            vbl_format = vbl_format_match.group(3)
-            vbl_name = vbl_label + ' ' + vbl_format_match.group(4)
-            vbl_name = re.sub('\(|\)', ' ', vbl_name)
-            data_dict.variable_format_dict[vbl_label] = vbl_format
+            if vbl_match.group("desc"):
+              vbl_name += ' ' + vbl_match.group("desc")
+            vbl_name = clean_name(vbl_name)
             data_dict.vbls_seen.add(vbl_name)
             data_dict.variable_dict[vbl_label] = vbl_name
             for idx_col_pattern in INDEX_COLUMNS:
               if re.search(idx_col_pattern, vbl_name, re.IGNORECASE):
                 index_cols.add(vbl_name)
+            if vbl_match.group("format"):
+              data_dict.variable_format_dict[vbl_label] = vbl_match.group(
+                  "format")
           elif bytewise_match:
             start_pos = int(bytewise_match.group(1))
             vbl_label = bytewise_match.group(2)
@@ -435,7 +464,7 @@ def main():
             data_dict.add_bytewise_encoding(start_pos, vbl_label,
                                             num_len_string)
             if re.search('\$\d+\.', line):
-              data_dict.variable_type[vbl_label] = "string"
+              data_dict.key_type[vbl_label] = "string"
           elif nullrule_match:
             vbl_label = nullrule_match.group(1)
             null_value = nullrule_match.group(2)
@@ -480,50 +509,116 @@ def main():
 
       # Now we've read off the schema describing how to parse the flat file
       # records into dataframe records.  Now we just need to do the parsing.
-      df = pandas.DataFrame(columns=data_dict.vbls_seen)
+#      df = pandas.DataFrame(columns=data_dict.vbls_seen)
       record_cnt = 0
+      data_records = []
       with open(os.path.join(tmpdir, datafile), mode="r") as data:
-        data_records = []
         for record in data:
 #         record = record.decode('utf-8')
 #         print("Length of record = " + str(len(record)))
           record_cnt += 1
           # For testing
           if RECORD_LIMIT > 0 and record_cnt > RECORD_LIMIT: break
-          if record_cnt % 1000 == 0:
+          if record_cnt % 5000 == 0:
             print ("Read " + str(record_cnt) + " records.")
           record_dict = data_dict.parse(record)
 #         print("Record has " + str(len(record_dict)) + " entries.")
           data_records.append(record_dict)
-        df = df.append(data_records, ignore_index=True)
+#        df = df.append(data_records, ignore_index=True)
       
       print("Data file read; " + str(record_cnt) + " records seen.")
-    
-      col_cnt = 0
-      col_set = set()
-      col_set |= index_cols
-      while col_cnt < len(df.columns):
-        col_set.add(df.columns[col_cnt])
-        col_cnt += 1
-        if (col_cnt % MAX_COL_CNT) == 0 or col_cnt == len(df.columns):
-          table_name = base_table_name
-          if table_cnt > 0:
-            table_name += "-" + str(table_cnt)
-          print("Writing to " + table_name)
-          export_df = df.loc[:, sorted(list(col_set))]
-          #print(export_df.shape)
-          #export_df.to_sql(name=table_name, con=engine, if_exists='replace')
-          try:
-            drop(pg_conn_str + "::" + table_name)
-          except:
-            print(table_name + " does not exist.  Creating from scratch.")
-          odo(export_df, pg_conn_str + "::" + table_name)
-          col_set.clear()
-          col_set |= index_cols
-          table_cnt += 1
-          print("Finished writing to " + table_name)
 
+      if record_cnt == 0:
+        print("No records found; misread file?")
+        writes_succeeded = False
+
+      try:
+        col_cnt = 0
+        col_set = set()
+        col_set |= index_cols
+        columns = list(data_dict.vbls_seen)
+        while col_cnt < len(columns):
+          col_set.add(columns[col_cnt])
+          col_cnt += 1
+          if (col_cnt % MAX_COL_CNT) == 0 or col_cnt == len(columns):
+            table_name = base_table_name
+            if table_cnt > 0:
+              table_name += "-" + str(table_cnt)
+            print("Writing to " + table_name)
+#            export_df = df.loc[:, list(col_set)]
+#            dshape = export_df.shape
+            #print(export_df.shape)
+            #export_df.to_sql(name=table_name, con=engine, if_exists='replace')
+            try:
+              drop(pg_conn_str + "::" + table_name)
+            except:
+              print(table_name + " does not exist.  Creating from scratch.")
+            #table_csv = os.path.join(tmpdir, table_name + ".csv")
+            #print("Writing temp CSV to " + table_csv)
+#            export_df.to_csv(table_csv)
+            #with open(table_csv, "w") as tfh:
+            col_headers = list(col_set)
+            #  writer = csv.DictWriter(tfh, col_headers)
+            #  writer.writeheader()
+            temp_table = []
+#            header_str = ""
+#            type_str = ""
+            dshape_str = "var * {"
+            for k in col_headers:
+#              print("|" + k.split(" ")[0] + "|")
+#              print(data_dict.variable_type[k.split(" ")[0]])
+              #header_str += "\'" + k + "\', "
+              dshape_str += "\"" + k + "\": "
+              if k.split(" ")[0] in data_dict.variable_type:
+                #type_str += data_dict.variable_type[k] + ", "
+                dshape_str += data_dict.variable_type[k.split(" ")[0]] + ", "
+              else:
+                dshape_str += "int32, "
+                #type_str += "int32, "
+#             dshape_str += "\"" + k + "\": " + data_dict.variable_type[k] + ","
+            #dshape_str = "var * struct[[" + header_str[:-2] + "],["
+            #dshape_str += type_str[:-2] + "]]"
+            dshape_str = dshape_str[:-2] + "}"
+            for row in data_records:
+              temp_row = {k: row[k] for k in col_headers if k in row}
+              temp_row.update({k: "" for k in col_headers if (
+                  k.split(" ")[0] in data_dict.variable_type and
+                  data_dict.variable_type[k.split(" ")[0]] == "string" and
+                  not k in row)})
+              temp_row.update({k: NULL_INT_VALUE for k in col_headers if (
+                  k.split(" ")[0] in data_dict.variable_type and
+                  data_dict.variable_type[k.split(" ")[0]] == "int32" and
+                  not k in row)})
+              temp_row.update({k: NULL_FLOAT_VALUE for k in col_headers if (
+                  k.split(" ")[0] in data_dict.variable_type and
+                  data_dict.variable_type[k.split(" ")[0]] == "float32" and
+                  not k in row)})
+              temp_row.update({k: False for k in col_headers if (
+                  k.split(" ")[0] in data_dict.variable_type and
+                  data_dict.variable_type[k.split(" ")[0]] == "bool" and
+                  not k in row)})
+              temp_row.update({k: NULL_INT_VALUE for k in col_headers if not (
+                  k.split(" ")[0] in data_dict.variable_type or k in row)})
+              temp_table.append(temp_row)
+          #      writer.writerow(temp_row)
+            print("Wrote temp CSV")
+            start_time = timeit.default_timer()
+          #  odo(table_csv, pg_conn_str + "::" + table_name)
+            odo(temp_table, pg_conn_str + "::" + table_name,
+                dshape = dshape_str)
+            elapsed = timeit.default_timer() - start_time
+            col_set.clear()
+            col_set |= index_cols
+            table_cnt += 1
+            print("Finished writing to " + table_name + " in " +
+                  str(elapsed) + "s")
+      except:
+        writes_succeeded = False
+        print("Could not write tables for " + schemafile + " in " + zfile)
+        
     shutil.rmtree(tmpdir)
+    if writes_succeeded:
+      os.remove(zfile)
 
 #    df.to_sql(name=table_name, con=engine, if_exists='replace')
 #    print(table_name)
