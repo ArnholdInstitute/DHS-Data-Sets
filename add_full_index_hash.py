@@ -22,16 +22,8 @@ from sqlalchemy import create_engine
 # Index columns are identified by having one of these substrings.
 INDEX_COLUMNS = [ "Facility number", "Unit line number", "unit type",
     "provider line number", "Case Identification", "Cluster number",
-    "Household number", "Respondent\'s line number", "Country code" ]
+    "Household number", "Country code" ]
 
-
-def get_index_column_query(table_name):
-  query = "SELECT column_name FROM information_schema.columns "
-  query += "WHERE table_name = \"" +table_name+ "\" AND (column_name ILIKE \"%"
-  query += "%\" OR column_name ILIKE \"%".join(INDEX_COLUMNS)
-  query += "%\")"
-  return query
-  
 
 def main():
   pg_username = input("Please enter Postgres username:")
@@ -44,13 +36,14 @@ def main():
   get_index_columns_query = (
       'SELECT table_name, column_name '
       'FROM information_schema.columns '
-      'WHERE table_name ILIKE \"DHS_%\" '
-      'AND (column_name ILIKE \"%')
-  get_index_columns_query += '%\" OR column_name ILIKE \"%'.join(INDEX_COLUMNS)
-  get_index_columns_query += '%\") ORDER BY 1,2 ASC'
+      'WHERE table_name ILIKE \'DHS_%%\' '
+      'AND (column_name ILIKE \'%%')
+  get_index_columns_query += '%%\' OR column_name ILIKE \'%%'.join(INDEX_COLUMNS)
+  get_index_columns_query += '%%\') ORDER BY 1,2 ASC'
 
   table_queries = {}
   
+#  print(get_index_columns_query)
   with engine.connect() as con:
     res = con.execute(get_index_columns_query)
     for row in res:
@@ -58,22 +51,22 @@ def main():
       if not tname in table_queries:
         table_queries[tname] = (
             'UPDATE \"' + tname + '\" '
-            'SET full_index_hash = SELECT (\"x\"||substr(md5('
-            '\"' + tname + '\".\"' + row['column_name'] + '\"'
+            'SET full_index_hash = (\'x\'||substr(md5('
+            '\"' + row['column_name'] + '\"'
         )
       else:
-        table_queries[tname] += (
-            '||\"' + tname + '\".\"' + row['column_name'] + '\"')
+        table_queries[tname] += '||\"' + row['column_name'] + '\"'
         
   
     for tname in table_queries:
       table_queries[tname] += ('),1,8))::bit(32)::int')
+#      print(table_queries[tname])
       con.execute(
           'ALTER TABLE \"' + tname + '\" ADD COLUMN full_index_hash INT')
       con.execute(table_queries[tname])
       con.execute(
           'ALTER TABLE \"' + tname + '\" '
-          'ALTER COLUMN full_index_hash SET NOTNULL')
+          'ALTER COLUMN full_index_hash SET NOT NULL')
     
     
 if __name__ == '__main__':
